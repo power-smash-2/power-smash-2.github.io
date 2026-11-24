@@ -535,7 +535,7 @@ kbd{font:700 14px/1 var(--body);background:var(--ink);border:1px solid var(--mut
     <section class="screen" id="screen-online" hidden>
       <p class="kicker">Play online</p>
       <h2>Challenge a friend on another device</h2>
-      <p class="lede" id="olStatus">One player creates a match and gets a 4-letter code. The other player types that code to join. You both need this game open, shared with you.</p>
+      <p class="lede" id="olStatus">One player creates a match and gets a 4-letter code. The other player types that code to join.</p>
       <div class="ol-grid">
         <div class="ol-card">
           <p class="kicker">Game</p>
@@ -7763,7 +7763,7 @@ function tickFrame(now) {
 }
 requestAnimationFrame(frame);
 // Test mode (?nettest): browsers freeze animation in background tabs, so keep a hidden test tab ticking.
-if (/nettest/.test(location.search)) setInterval(() => { if (performance.now() - lastRaf > 100) tickFrame(performance.now()); }, 33);
+if (/nettest|nettick/.test(location.search)) setInterval(() => { if (performance.now() - lastRaf > 100) tickFrame(performance.now()); }, 33);
 
 /* ================= Screens & menus ================= */
 function show(name) {
@@ -8133,13 +8133,64 @@ function mockRoomLib() {
       leave:async () => { alive = false; clearInterval(hb); try { ch.postMessage({ peer:me, leave:true }); ch.close(); } catch (e) {} } };
   } };
 }
+// Off claude.ai (for example on GitHub Pages) the two devices connect directly with PeerJS, loaded on demand.
+// The creator registers the match code with the free PeerJS server; the friend connects to that code. Same
+// presence-style interface as the claude.ai room, so the rest of online play doesn't care which one is in use.
+const PEERJS_URL = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', PEER_PREFIX = 'pwrsmash7-';
+function loadPeerJs() {
+  return new Promise((res, rej) => {
+    if (window.Peer) return res(window.Peer);
+    const s = document.createElement('script'); s.src = PEERJS_URL; s.async = true;
+    s.onload = () => window.Peer ? res(window.Peer) : rej(new Error('load')); s.onerror = () => rej(new Error('load'));
+    document.head.appendChild(s);
+  });
+}
+function peerRoomLib() {
+  return { async join(name, role) {
+    const Peer = await loadPeerJs(), hostId = PEER_PREFIX + name;
+    let mine = {}, theirs = null, theirsAt = 0, conn = null, alive = true, sendT = null;
+    const subs = new Set();
+    const live = () => !!(conn && conn.open && theirs && Date.now() - theirsAt < 5000);
+    const peersArr = () => { const a = [{ peer:'me', isMe:true, sameTab:true, by:null, kind:'viewer', guest:false, presence:mine, updatedAt:Date.now() }];
+      if (live()) a.push({ peer:'them', isMe:false, sameTab:false, by:null, kind:'viewer', guest:false, presence:theirs, updatedAt:theirsAt }); return a; };
+    const notify = () => subs.forEach(fn => { try { fn({ peers:peersArr(), joined:[], left:[], updated:[] }); } catch (e) {} });
+    const send = () => { if (conn && conn.open) try { conn.send({ presence:mine }); } catch (e) {} };
+    const attach = c => {
+      if (conn && conn !== c && conn.open) { try { c.close(); } catch (e) {} return; } // one opponent per match
+      conn = c;
+      c.on('open', () => { send(); notify(); });
+      c.on('data', d => { if (d && typeof d === 'object' && d.presence && typeof d.presence === 'object' && !Array.isArray(d.presence)) { theirs = d.presence; theirsAt = Date.now(); notify(); } });
+      c.on('close', () => { if (conn === c) { conn = null; theirs = null; notify(); } });
+      c.on('error', () => {});
+    };
+    const peer = await new Promise((res, rej) => {
+      const p = role === 'host' ? new Peer(hostId) : new Peer();
+      const t = setTimeout(() => { rej(new Error('timeout')); try { p.destroy(); } catch (e) {} }, 15000);
+      p.on('open', () => { clearTimeout(t); res(p); });
+      p.on('error', e => { clearTimeout(t); rej(e); });
+    });
+    peer.on('error', () => {}); // e.g. the host isn't there yet: the guest just keeps trying
+    if (role === 'host') peer.on('connection', attach);
+    const tryConnect = () => { if (!alive || role === 'host' || (conn && conn.open)) return; conn = null; attach(peer.connect(hostId)); };
+    tryConnect();
+    // keep-alive: re-send presence every second, reconnect if needed, and drop an opponent who went quiet
+    const hb = setInterval(() => { if (!alive) return; send(); if (role !== 'host' && !(conn && conn.open)) tryConnect(); if (theirs && Date.now() - theirsAt > 5000) { theirs = null; notify(); } }, 1000);
+    return { name, peers:peersArr, connected:() => !!(conn && conn.open),
+      presence:async patch => { mine = { ...mine }; for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
+        if (!sendT) sendT = setTimeout(() => { sendT = null; send(); }, 33); }, // about 30 updates a second, like the claude.ai room
+      onPeers:fn => { subs.add(fn); setTimeout(() => fn({ peers:peersArr(), joined:[], left:[], updated:[] }), 0); return () => subs.delete(fn); },
+      leave:async () => { alive = false; clearInterval(hb); clearTimeout(sendT); try { if (conn) conn.close(); } catch (e) {} try { peer.destroy(); } catch (e) {} } };
+  } };
+}
 let olRoomLib = null, olRoomTried = false;
 async function olGetRoomLib() {
   if (olRoomLib) return olRoomLib;
   if (/nettest/.test(location.search) && window.BroadcastChannel) return (olRoomLib = mockRoomLib());
-  if (olRoomTried) return null;
-  olRoomTried = true;
-  try { if (window.claude && window.claude.use) olRoomLib = await window.claude.use('room'); } catch (e) { olRoomLib = null; }
+  if (!olRoomTried) {
+    olRoomTried = true;
+    try { if (window.claude && window.claude.use) olRoomLib = await window.claude.use('room'); } catch (e) { olRoomLib = null; }
+  }
+  if (!olRoomLib) olRoomLib = peerRoomLib(); // not on claude.ai: connect directly with PeerJS
   return olRoomLib;
 }
 // A hero sent by the other player is untrusted data: copy it, keep strings short and numbers in sane ranges.
@@ -8192,8 +8243,17 @@ function olPublishLobby() {
 async function olEnter(role, code) {
   const lib = await olGetRoomLib();
   if (!lib) { $('#olStatus').textContent = 'Online play only works when this game is opened on claude.ai while you are signed in, and the game is shared with your friend.'; return; }
-  try { NET.room = await lib.join('ps-' + code.toLowerCase()); }
-  catch (e) { $('#olStatus').textContent = 'Couldn’t open that match right now. Check your connection and try again.'; NET.room = null; return; }
+  $('#olStatus').textContent = 'Connecting…';
+  try { NET.room = await lib.join('ps-' + code.toLowerCase(), role); }
+  catch (e) {
+    NET.room = null;
+    const t = e && e.type;
+    $('#olStatus').textContent = t === 'unavailable-id' ? 'That match code is already in use. Press Create match again for a new one.'
+      : e && e.message === 'load' ? 'Couldn’t load the online service. Check the internet connection (some school networks block it).'
+      : 'Couldn’t connect right now. Check the internet connection and try again.';
+    return;
+  }
+  $('#olStatus').textContent = 'One player creates a match and gets a 4-letter code. The other player types that code to join.';
   Object.assign(NET, { role, code, state:'lobby', match:0, seen:0, applied:0, oppGone:0, result:null, opp:null, lastIn:{ u:0, p:0, k:0, s:0 } });
   olMsg(role === 'host' ? 'Tell your friend this code. When they join, press Start.' : 'Joining… waiting for the host.');
   showOnline();
@@ -8321,7 +8381,7 @@ function netTick(raw) {
     NET.state = 'lobby'; game = null; stageMode = null; showOnline(); toast('The host left the match.');
   }
 }
-$('#modeOnline').addEventListener('click', () => { audioInit(); if (!NET.room) $('#olStatus').textContent = 'One player creates a match and gets a 4-letter code. The other player types that code to join. You both need this game open, shared with you.'; showOnline(); });
+$('#modeOnline').addEventListener('click', () => { audioInit(); if (!NET.room) $('#olStatus').textContent = 'One player creates a match and gets a 4-letter code. The other player types that code to join.'; showOnline(); });
 $('#olHeroBtn').addEventListener('click', () => openSelect('online'));
 $('#olCreate').addEventListener('click', () => { audioInit(); let c = ''; for (let i = 0; i < 4; i++) c += OL_LETTERS[Math.floor(Math.random() * OL_LETTERS.length)]; olEnter('host', c); });
 $('#olJoinForm').addEventListener('submit', e => { e.preventDefault(); audioInit(); const c = $('#olCode').value.toUpperCase().replace(/[^A-Z]/g, ''); if (c.length !== 4) { $('#olStatus').textContent = 'Match codes are 4 letters.'; return; } olEnter('guest', c); });
