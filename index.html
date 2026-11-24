@@ -4563,7 +4563,7 @@ function startBash(h1, h2, origin, mode) {
   buildBashLayers(players);
   const pool = TWISTS.filter(t => t.id !== lastTwist), twist = pick(pool); lastTwist = twist.id;
   bash = Object.assign(newFx(), { origin, mode, players, time:0, paused:false, phase:'intro', phaseT:0, clock:BASH_TIME,
-    targets:[], bullets:[], clickQueued:false, doubleShown:false, twist, wallT:10, giantDone:false });
+    targets:[], bullets:[], clickQueued:false, doubleShown:false, twist, wallT:10, giantDone:false, online:origin === 'online' ? 'host' : null, me:0 });
   FX = bash; setStage('bash'); sfx('round');
 }
 const doublePoints = () => bash.phase === 'play' && bash.clock <= 10;
@@ -4671,6 +4671,7 @@ function bashStep(raw) {
   else steer(p1, ['KeyA'], ['KeyD'], ['KeyW'], ['KeyS']);
   const fire = [anyPressed(solo ? ['Space','KeyF','KeyJ','Enter'] : ['Space','KeyF']) || b.clickQueued, false];
   if (p2.ctrl === 'p2') { steer(p2, ['ArrowLeft'], ['ArrowRight'], ['ArrowUp'], ['ArrowDown']); fire[1] = anyPressed(['Enter','NumpadEnter','Slash','Period','Numpad0']); }
+  else if (p2.ctrl === 'net') fire[1] = netBashInput(p2);
   else fire[1] = b.phase === 'play' && aiAim(p2, dt);
   b.clickQueued = false; pressed.clear();
   b.players.forEach(pl => {
@@ -4836,7 +4837,7 @@ function drawReticle(c, pl) {
   });
   c.beginPath(); c.arc(0, 0, 2.5, 0, TAU); c.fillStyle = col; c.fill();
   c.font = `16px ${FONT}`; c.textAlign = 'left'; c.textBaseline = 'middle'; c.lineWidth = 4; c.strokeStyle = INK;
-  const tag = pl.ctrl === 'cpu' ? 'CPU' : 'P' + (pl.side + 1);
+  const tag = pl.ctrl === 'cpu' ? 'CPU' : bash.online ? (pl.side === bash.me ? 'YOU' : 'FRIEND') : 'P' + (pl.side + 1);
   c.strokeText(tag, 20, -20); c.fillStyle = col; c.fillText(tag, 20, -20);
   c.restore();
 }
@@ -4848,7 +4849,7 @@ function bashHud(c) {
     const P = PANELS[pl.side], x0 = P.x0 + 10, w = P.x1 - P.x0 - 20;
     c.fillStyle = pl.color; c.fillRect(x0, PANEL_BOT + 4, w, 3);
     c.font = `19px ${FONT}`; c.textAlign = 'left'; c.textBaseline = 'alphabetic'; c.fillStyle = lighten(pl.color, .3);
-    c.fillText(`${(pl.hero.short || pl.hero.name).toUpperCase()} · ${pl.ctrl === 'cpu' ? 'CPU' : 'P' + (pl.side + 1)}`, x0 + 4, 503);
+    c.fillText(`${(pl.hero.short || pl.hero.name).toUpperCase()} · ${pl.ctrl === 'cpu' ? 'CPU' : b.online ? (pl.side === b.me ? 'YOU' : 'FRIEND') : 'P' + (pl.side + 1)}`, x0 + 4, 503);
     c.font = `700 14px ${BODY}`; c.fillStyle = '#b1a8cc';
     c.fillText(`${pl.colorName} · ${pl.hits} HIT · ${accuracy(pl)}% · STREAK ${pl.streak || 0}`, x0 + 4, 527);
     if (streakMult(pl) > 1) {
@@ -4902,6 +4903,7 @@ function bashRender(c) {
   if (b.paused) drawPause(c, b.origin === 'world' ? 'Esc to resume  ·  Q to leave the booth' : 'Esc to resume  ·  Q to quit to menu');
 }
 function bashOver() {
+  if (bash.online) { netBashOver(); return; }
   const b = bash, [p1, p2] = b.players, winner = p1.score === p2.score ? null : p1.score > p2.score ? p1 : p2;
   const humans = b.players.filter(pl => pl.ctrl !== 'cpu').map(pl => pl.score);
   const prevBest = bashBest; bashBest = Math.max(bashBest, ...humans);
@@ -6374,8 +6376,8 @@ function startBoard(setup = bdSetup, origin = 'menu') {
   BD_SPACES = bdMakeBoard(); BD_BG = buildBoardBg(); // a new board layout every race
   bdLastSetup = [setup, origin];
   const players = setup.map((s, i) => ({ ...s, i })).filter(s => s.ctrl !== 'off').map((s, k) => ({ idx:k, slot:s.i, ctrl:s.ctrl,
-    hero:dressed(allHeroes().find(h => h.id === s.hero) || HEROES[k]), pos:0, shield:false, skip:false, extra:false, hop:null }));
-  board = Object.assign(newFx(), { origin, players, turn:0, phase:'intro', phaseT:0, time:0, paused:false, queue:[], act:null, wheelA:-Math.PI / 2 - Math.PI / 8, wheelV:0,
+    hero:s.heroObj || dressed(allHeroes().find(h => h.id === s.hero) || HEROES[k]), pos:0, shield:false, skip:false, extra:false, hop:null }));
+  board = Object.assign(newFx(), { origin, online:origin === 'online' ? 'host' : null, me:0, players, turn:0, phase:'intro', phaseT:0, time:0, paused:false, queue:[], act:null, wheelA:-Math.PI / 2 - Math.PI / 8, wheelV:0,
     wheelW:bdWeights(0), wheelTarget:bdWeights(0), tilt:0,
     spinResult:null, msg:null, winner:null, cpuT:0, clickQueued:false, rounds:1 });
   FX = board; setStage('board'); sfx('round');
@@ -6471,8 +6473,15 @@ function boardStep(raw) {
   const S = board;
   if (S.paused) { pressed.clear(); S.clickQueued = false; return; }
   S.time += raw; updateFx(raw); S.phaseT += raw;
-  const press = anyPressed(['Space', 'Enter', 'KeyF', 'KeyJ']) || S.clickQueued;
+  // Online: the friend's spins, choices and message-skips arrive as counters in their presence.
+  const gi = S.online === 'host' ? netBoardInput() : null, localPress = anyPressed(['Space', 'Enter', 'KeyF', 'KeyJ']) || S.clickQueued;
+  const press = localPress || !!(gi && gi.press), turnPress = bdCur().ctrl === 'net' ? !!(gi && gi.press) : localPress;
   // POWER choice: arrows or 1/2 to pick, Space to confirm, or click a button.
+  if (S.phase === 'choose' && S.choice.p.ctrl === 'net') {
+    const ch = S.choice; S.clickQueued = false; pressed.clear();
+    if (gi) { ch.sel = gi.sel ? 1 : 0; if (gi.go) { S.phase = 'resolve'; S.choice = null; bdPower(ch.p, ch.t, ch.sel ? 'blast' : 'boost'); bdQ(S, { type:'end' }); sfx('coin'); } }
+    return;
+  }
   if (S.phase === 'choose') {
     const ch = S.choice;
     if (anyPressed(['ArrowLeft', 'KeyA', 'Digit1'])) ch.sel = 0;
@@ -6507,7 +6516,7 @@ function boardStep(raw) {
     else { S.phase = 'await'; S.cpuT = .7 + Math.random() * .5; }
   } else if (S.phase === 'await') {
     if (p.ctrl === 'cpu') { if ((S.cpuT -= raw) <= 0) bdSpin(); }
-    else if (press) bdSpin();
+    else if (turnPress) bdSpin();
   }
   // run queued actions one after another
   if (S.phase === 'resolve' && !S.act && S.queue.length) { S.act = S.queue.shift(); S.act.t = 0; S.act.started = false; }
@@ -6568,6 +6577,7 @@ function bdWin(P) {
   addWord(`${(P.hero.short || P.hero.name).toUpperCase()} WINS!`, 330, 250, POW, 52, true);
 }
 function bdOver() {
+  if (board.online) { netBoardOver(); return; }
   const S = board, order = [S.winner, ...S.players.filter(p => p !== S.winner).sort((a, b) => b.pos - a.pos)];
   const human = S.winner.ctrl !== 'cpu';
   if (human) { unlock('board_win'); celebrateNext = true; }
@@ -6638,16 +6648,16 @@ function boardRender(c) {
     rr(c, 656, y, 288, 38, 6); c.fillStyle = cur ? 'rgba(255,210,63,.18)' : 'rgba(255,255,255,.05)'; c.fill(); c.lineWidth = cur ? 3 : 1.5; c.strokeStyle = cur ? POW : 'rgba(255,255,255,.15)'; c.stroke();
     c.beginPath(); c.arc(678, y + 19, 13, 0, TAU); inked(c, P.hero.suit, 2.5); c.beginPath(); c.arc(678, y + 19, 6, 0, TAU); c.fillStyle = P.hero.trim; c.fill();
     c.font = `18px ${FONT}`; c.textAlign = 'left'; c.fillStyle = PAPER; c.fillText((P.hero.short || P.hero.name).toUpperCase(), 698, y + 18);
-    c.font = `700 12px ${BODY}`; c.fillStyle = '#b1a8cc'; c.fillText(`${P.ctrl === 'cpu' ? 'CPU' : 'Player ' + (P.slot + 1)}${P.shield ? ' · SHIELD' : ''}${P.skip ? ' · NETTED' : ''}`, 698, y + 32);
+    c.font = `700 12px ${BODY}`; c.fillStyle = '#b1a8cc'; c.fillText(`${P.ctrl === 'cpu' ? 'CPU' : S.online ? (P.idx === S.me ? 'You' : 'Online friend') : 'Player ' + (P.slot + 1)}${P.shield ? ' · SHIELD' : ''}${P.skip ? ' · NETTED' : ''}`, 698, y + 32);
     c.font = `22px ${FONT}`; c.textAlign = 'right'; c.fillStyle = P.pos >= BD_LAST ? '#ff7af0' : POW; c.fillText(P.pos >= BD_LAST ? 'WIN!' : `${P.pos}/${BD_LAST}`, 934, y + 27);
   });
   // spinner and its button
   drawWheel(c, S, 800, 372, 84);
-  const human = p.ctrl !== 'cpu' && !S.winner;
+  const human = (S.online ? p.idx === S.me : p.ctrl !== 'cpu') && !S.winner;
   rr(c, 712, 488, 176, 38, 8);
   c.fillStyle = S.phase === 'await' && human ? (Math.sin(S.time * 6) > 0 ? RED : '#c22a24') : '#3a3254'; c.fill(); c.lineWidth = 3; c.strokeStyle = INK; c.stroke();
   c.font = `22px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillStyle = PAPER;
-  c.fillText(S.phase === 'await' ? (human ? 'SPIN! (SPACE)' : 'CPU SPINNING…') : S.phase === 'spinning' ? 'SPINNING…' : S.phase === 'choose' ? 'CHOOSE!' : S.winner ? 'RACE OVER' : 'WAIT…', 800, 508);
+  c.fillText(S.phase === 'await' ? (human ? 'SPIN! (SPACE)' : S.online ? 'FRIEND’S SPIN…' : 'CPU SPINNING…') : S.phase === 'spinning' ? 'SPINNING…' : S.phase === 'choose' ? 'CHOOSE!' : S.winner ? 'RACE OVER' : 'WAIT…', 800, 508);
   // event card
   if (S.msg) {
     const m = S.msg, k = Math.min(1, m.t / .18), w = 420, h = 128, x = 320 - w / 2, y = 200;
@@ -6684,7 +6694,7 @@ function boardRender(c) {
       c.font = `${a.length > 18 ? 15 : 19}px ${FONT}`; c.fillStyle = PAPER; c.fillText(a, bx + bw / 2, by + 24);
       c.font = `700 13px ${BODY}`; c.fillStyle = on ? PAPER : '#b1a8cc'; c.fillText(`${i + 1} · ${b2}`, bx + bw / 2, by + 46);
     });
-    c.font = `700 13px ${BODY}`; c.fillStyle = INK; c.fillText('←/→ or 1/2 to choose · Space or click to confirm', 320, 258);
+    c.font = `700 13px ${BODY}`; c.fillStyle = INK; c.fillText(S.online && ch.p.idx !== S.me ? `Waiting for your friend to choose…` : '←/→ or 1/2 to choose · Space or click to confirm', 320, 258);
   }
   if (S.phase === 'intro') { drawBanner(c, 'GLOOM TOWER RACE!', S.phaseT, 64, 220); c.save(); c.translate(-160, 0); drawPlate(c, 'Spin, race across Metro Bay, and reach the tower first!', 290, 18); c.restore(); }
   else if (S.phase === 'turnStart' && !S.winner) { c.save(); c.translate(-160, 0); drawBanner(c, `${(p.hero.short || p.hero.name).toUpperCase()}'S TURN`, S.phaseT, 48, 140); c.restore(); }
@@ -7726,18 +7736,19 @@ function holidayOver() {
 
 function setStage(kind) {
   stageMode = kind;
-  $('#touchPause').textContent = game && game.online && (kind === 'fight' || kind === 'netfight') ? 'Leave match' : '❚❚ Pause';
+  const olS = /fight/.test(kind) ? game : /bash/.test(kind) ? bash : /board/.test(kind) ? board : null;
+  $('#touchPause').textContent = olS && olS.online ? 'Leave match' : '❚❚ Pause';
   $('#hint').innerHTML = kind === 'fight' ? (sel.mode === 2 ? HINTS.fight2 : HINTS.fight1)
     : kind === 'bash' ? (bash && bash.mode === 2 ? HINTS.bash2 : HINTS.bash1)
     : kind === 'smash' ? (smash && smash.mode === 2 ? HINTS.smash2 : HINTS.smash1) : HINTS[kind];
   setTouch(kind);
-  cv.style.cursor = kind === 'bash' ? 'none' : kind === 'puzzle' ? 'crosshair' : '';
-  cv.style.touchAction = kind === 'bash' || kind === 'puzzle' ? 'none' : '';
+  cv.style.cursor = /bash/.test(kind) ? 'none' : kind === 'puzzle' ? 'crosshair' : '';
+  cv.style.touchAction = /bash/.test(kind) || kind === 'puzzle' ? 'none' : '';
   held.clear(); pressed.clear();
   musicDuck(false);
   show('stage');
 }
-const current = () => stageMode === 'fight' || stageMode === 'netfight' ? game : stageMode === 'world' ? world : stageMode === 'bash' ? bash : stageMode === 'smash' ? smash : stageMode === 'puzzle' ? puzzle : stageMode === 'board' ? board : stageMode === 'holiday' ? hol : null;
+const current = () => stageMode === 'fight' || stageMode === 'netfight' ? game : stageMode === 'world' ? world : stageMode === 'bash' || stageMode === 'netbash' ? bash : stageMode === 'smash' ? smash : stageMode === 'puzzle' ? puzzle : stageMode === 'board' || stageMode === 'netboard' ? board : stageMode === 'holiday' ? hol : null;
 
 let last = performance.now();
 let lastRaf = 0;
@@ -7759,6 +7770,8 @@ function tickFrame(now) {
     else if (mode === 'board' && board) { boardStep(raw); if (screen === 'stage' && stageMode === 'board' && board) boardRender(ctx); }
     else if (mode === 'holiday' && hol) { holidayStep(raw); if (screen === 'stage' && stageMode === 'holiday' && hol) holidayRender(ctx); }
     else if (mode === 'netfight' && game) { netGuestFightStep(raw); if (screen === 'stage' && stageMode === 'netfight' && game) fightRender(ctx); }
+    else if (mode === 'netbash' && bash) { netGuestBashStep(raw); if (screen === 'stage' && stageMode === 'netbash' && bash) bashRender(ctx); }
+    else if (mode === 'netboard' && board) { netGuestBoardStep(raw); if (screen === 'stage' && stageMode === 'netboard' && board) boardRender(ctx); }
   }
 }
 requestAnimationFrame(frame);
@@ -8116,7 +8129,8 @@ freshBtn.addEventListener('click', () => {
      draws the fight from the host's snapshots.
    With ?nettest in the address, two tabs on one computer talk over a BroadcastChannel instead (for testing). */
 const OL_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-const OL_GAMES = [['fight', 'Power Smasher', true], ['bash', 'Bullet Bash', false], ['board', 'Gloom Tower Race', false]];
+const OL_GAMES = [['fight', 'Power Smasher', true], ['bash', 'Bullet Bash', true], ['board', 'Gloom Tower Race', true]];
+const olGameName = id => (OL_GAMES.find(g => g[0] === id) || OL_GAMES[0])[1];
 function mockRoomLib() {
   const me = 'p' + Math.random().toString(36).slice(2, 10);
   return { async join(name) {
@@ -8169,13 +8183,24 @@ function peerRoomLib() {
       p.on('open', () => { clearTimeout(t); res(p); });
       p.on('error', e => { clearTimeout(t); rej(e); });
     });
-    peer.on('error', () => {}); // e.g. the host isn't there yet: the guest just keeps trying
+    // What the friend's screen shows while connecting: 'looking', 'nohost' (no match with that code yet), 'slow', 'ok'.
+    let stage = role === 'host' ? 'ok' : 'looking', triedAt = 0, startAt = Date.now();
+    peer.on('error', e => { if (e && e.type === 'peer-unavailable') { stage = 'nohost'; conn = null; triedAt = Date.now(); } });
+    peer.on('disconnected', () => { if (alive) try { peer.reconnect(); } catch (e) {} });
     if (role === 'host') peer.on('connection', attach);
-    const tryConnect = () => { if (!alive || role === 'host' || (conn && conn.open)) return; conn = null; attach(peer.connect(hostId)); };
+    // A connection between two real devices can take several seconds to set up, so an attempt gets 10 s before a retry.
+    const tryConnect = () => {
+      if (!alive || role === 'host' || (conn && conn.open)) return;
+      if (conn && Date.now() - triedAt < 10000) return;
+      if (conn) { try { conn.close(); } catch (e) {} conn = null; }
+      triedAt = Date.now(); attach(peer.connect(hostId, { reliable:true }));
+    };
     tryConnect();
     // keep-alive: re-send presence every second, reconnect if needed, and drop an opponent who went quiet
-    const hb = setInterval(() => { if (!alive) return; send(); if (role !== 'host' && !(conn && conn.open)) tryConnect(); if (theirs && Date.now() - theirsAt > 5000) { theirs = null; notify(); } }, 1000);
-    return { name, peers:peersArr, connected:() => !!(conn && conn.open),
+    const hb = setInterval(() => { if (!alive) return; send();
+      if (role !== 'host') { if (conn && conn.open) stage = 'ok'; else { if (stage !== 'nohost' && Date.now() - startAt > 12000) stage = 'slow'; if (!conn && stage === 'nohost' && Date.now() - triedAt < 3000) return; tryConnect(); } }
+      if (theirs && Date.now() - theirsAt > 5000) { theirs = null; notify(); } }, 1000);
+    return { name, peers:peersArr, connected:() => !!(conn && conn.open), status:() => stage,
       presence:async patch => { mine = { ...mine }; for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
         if (!sendT) sendT = setTimeout(() => { sendT = null; send(); }, 33); }, // about 30 updates a second, like the claude.ai room
       onPeers:fn => { subs.add(fn); setTimeout(() => fn({ peers:peersArr(), joined:[], left:[], updated:[] }), 0); return () => subs.delete(fn); },
@@ -8213,7 +8238,7 @@ function olCleanHero(h) {
   o.size = num(o.size, .6, 1.4, 1); o.chest = num(o.chest, .6, 1.6, 1);
   const s = o.special && typeof o.special === 'object' ? o.special : { ...HEROES[0].special };
   s.dmg = num(s.dmg, 0, 20, 10); s.speed = num(s.speed, 0, 1400, 700); s.w = num(s.w, 4, 120, 40); s.h = num(s.h, 4, 120, 40);
-  if (typeof s.kind !== 'string') s.kind = 'bolt'; if (typeof s.name !== 'string') s.name = 'Power Blast';
+  if (typeof s.kind !== 'string' || !BASH_SHOT[s.kind]) s.kind = 'bolt'; if (typeof s.name !== 'string') s.name = 'Power Blast';
   o.special = s; delete o.custom; delete o.villain;
   return o;
 }
@@ -8228,9 +8253,10 @@ function showOnline() {
     b.addEventListener('click', () => { NET.game = id; showOnline(); });
     games.appendChild(b);
   });
-  games.querySelectorAll('.chip').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.g === NET.game)));
-  $('#olHeroName').textContent = NET.hero.name; olDrawHero($('#olHeroCv'), NET.hero);
   const inMatch = !!NET.room;
+  // in a match the creator picks the game; the friend's chips follow along
+  games.querySelectorAll('.chip').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.g === NET.game)); b.disabled = inMatch && NET.role === 'guest'; });
+  $('#olHeroName').textContent = NET.hero.name; olDrawHero($('#olHeroCv'), NET.hero);
   $('#olStartBox').hidden = inMatch; $('#olMatch').hidden = !inMatch;
   $('#olHeroBtn').disabled = inMatch && NET.role === 'host' && NET.state === 'play';
   if (inMatch) { $('#olCodeShow').textContent = NET.code; $('#olMeName').textContent = `${NET.hero.name} (you)`; olDrawHero($('#olMeCv'), NET.hero); olPublishLobby(); }
@@ -8261,9 +8287,19 @@ async function olEnter(role, code) {
 async function olLeave() {
   const r = NET.room; NET.room = null; NET.role = null; NET.log = false; NET.state = 'lobby';
   if (r) try { await r.leave(); } catch (e) {}
-  if (game && game.online) { game = null; stageMode = null; }
+  olEndLocal();
   showOnline();
 }
+// Drop whichever online game is on screen (local games are left alone).
+function olEndLocal() {
+  if (game && game.online) game = null;
+  if (bash && bash.online) bash = null;
+  if (board && board.online) board = null;
+  if (/^net|^fight$|^bash$|^board$/.test(stageMode || '') && !current()) stageMode = null;
+}
+// Which online game this device is hosting right now, if any.
+const olHosting = () => stageMode === 'fight' && game && game.online ? 'fight' : stageMode === 'bash' && bash && bash.online ? 'bash' : stageMode === 'board' && board && board.online ? 'board' : null;
+const olGuesting = () => (stageMode === 'netfight' && game) || (stageMode === 'netbash' && bash) || (stageMode === 'netboard' && board);
 const olOpponent = () => { if (!NET.room) return null; const want = NET.role === 'host' ? 'guest' : 'host'; return NET.room.peers().find(p => !p.isMe && p.presence && p.presence.role === want) || null; };
 // The guest's controls -> fighter input on the host. Jump/punch/kick/special are counters, so no press is lost to coalescing.
 function netFightInput() {
@@ -8280,10 +8316,20 @@ function olSnapshot() {
   return { g:{ round:g.round, phase:g.phase, phaseT:Math.round(g.phaseT * 100) / 100, clock:Math.round(g.clock * 10) / 10, time:Math.round(g.time * 100) / 100, shake:Math.round(g.shake || 0), flashT:Math.round((g.flashT || 0) * 100) / 100, koText:g.koText || '', rw:g.roundWinner ? g.roundWinner.side : -1 },
     f:g.f.map(olPrims), p:g.proj.slice(0, 8).map(olPrims) };
 }
-function netHostStartFight() {
-  const opp = olOpponent(); if (!opp) return;
-  const them = olCleanHero(opp.presence.hero), me = NET.hero;
-  NET.match = (NET.match || 0) + 1; NET.state = 'play'; NET.result = null; NET.rec = []; NET.lastIn = { ...(opp.presence.in && typeof opp.presence.in === 'object' ? opp.presence.in : { u:0, p:0, k:0, s:0 }) };
+// Host: start whichever game is picked. The friend's current button counters become the starting point.
+function netHostStart() {
+  const opp = olOpponent(); if (!opp) { showOnline(); return; }
+  NET.match = (NET.match || 0) + 1; NET.state = 'play'; NET.result = null; NET.rec = [];
+  const cur = opp.presence.in && typeof opp.presence.in === 'object' ? opp.presence.in : {};
+  NET.lastIn = { u:0, p:0, k:0, s:0, f:0, sp:0, go:0 };
+  for (const k in NET.lastIn) if (typeof cur[k] === 'number') NET.lastIn[k] = cur[k];
+  const them = olCleanHero(opp.presence.hero);
+  if (NET.game === 'bash') netHostStartBash(them);
+  else if (NET.game === 'board') netHostStartBoard(them);
+  else netHostStartFight(them);
+}
+function netHostStartFight(them) {
+  const me = NET.hero;
   sel.mode = 1; sel.picks = [me, them];
   const arena = pick(ARENAS), f0 = makeFighter(me, 0, 'p1'), f1 = makeFighter(them, 1, 'net');
   f1.mirror = me.id === them.id;
@@ -8332,7 +8378,7 @@ function netGuestFightStep(raw) {
   }
   // my controls -> my presence (held directions, and counters for button presses)
   const hi = humanInput(BIND), m = NET.myIn;
-  const next = { l:!!hi.left, r:!!hi.right, d:!!hi.down, u:m.u + (hi.up ? 1 : 0), p:m.p + (hi.punch ? 1 : 0), k:m.k + (hi.kick ? 1 : 0), s:m.s + (hi.special ? 1 : 0) };
+  const next = { ...m, l:!!hi.left, r:!!hi.right, d:!!hi.down, u:m.u + (hi.up ? 1 : 0), p:m.p + (hi.punch ? 1 : 0), k:m.k + (hi.kick ? 1 : 0), s:m.s + (hi.special ? 1 : 0) };
   pressed.clear();
   if (JSON.stringify(next) !== JSON.stringify(m)) { NET.myIn = next; NET.room.presence({ in:next }).catch(() => {}); }
 }
@@ -8340,20 +8386,198 @@ function netFightOver(w) {
   // host only: tell the guest who won, then show the result here
   NET.state = 'result'; NET.result = w.side; NET.log = false;
   const me = game.f[0], them = game.f[1];
-  NET.room.presence({ st:'result', w:w.side, sn:null, fx:null }).catch(() => {});
-  olShowResult(w.side === 0, me.hero, them.hero, true);
+  NET.room.presence({ st:'result', w:w.side, g:'fight', sc:null, sn:null, fx:null }).catch(() => {});
+  olShowResult(w.side === 0, me.hero, them.hero, true, 'fight', null);
 }
-function olShowResult(iWon, myHero, theirHero, isHost) {
-  if (iWon) { celebrateNext = true; unlock('first_win'); }
-  game = null; stageMode = null;
-  showResultScreen({ kicker:`Online match · code ${NET.code}`, hero: iWon ? myHero : theirHero, title: iWon ? 'YOU WIN!' : `${theirHero.name.toUpperCase()} WINS!`,
-    score: iWon ? 'VICTORY' : 'SO CLOSE!', sub: isHost ? 'Press Rematch to go again, or head back to the match lobby.' : 'Waiting for the host to start a rematch… or head back to the lobby.',
-    buttons: isHost ? [{ label:'Rematch', fn:() => { if (olOpponent()) netHostStartFight(); else showOnline(); } }, { label:'Match lobby', alt:true, fn:() => { NET.state = 'lobby'; olPublishLobby(); showOnline(); } }, { label:'Leave match', ghost:true, fn:olLeave }]
+// iWon: true, false, or null for a tie. sc: [host score, guest score] for Bullet Bash, [host space, guest space] for the race.
+function olShowResult(iWon, myHero, theirHero, isHost, g, sc) {
+  if (iWon) { celebrateNext = true; unlock(g === 'bash' ? 'bash_win' : g === 'board' ? 'board_win' : 'first_win'); }
+  olEndLocal(); stageMode = null;
+  const mine = sc ? sc[isHost ? 0 : 1] : 0, theirs = sc ? sc[isHost ? 1 : 0] : 0;
+  const score = g === 'bash' && sc ? `${mine.toLocaleString()} – ${theirs.toLocaleString()}` : g === 'board' ? (iWon ? 'FIRST TO THE TOWER' : `You reached space ${mine}`) : iWon ? 'VICTORY' : 'SO CLOSE!';
+  showResultScreen({ kicker:`Online ${olGameName(g)} · code ${NET.code}`, hero: iWon === false ? theirHero : myHero, bashLogo: g === 'bash',
+    title: iWon === null ? 'TIE GAME!' : iWon ? 'YOU WIN!' : `${theirHero.name.toUpperCase()} WINS!`,
+    score, sub: isHost ? 'Press Rematch to go again, or head back to the match lobby to pick another game.' : 'Waiting for the host to start a rematch… or head back to the lobby.',
+    buttons: isHost ? [{ label:'Rematch', fn:() => { if (olOpponent()) netHostStart(); else showOnline(); } }, { label:'Match lobby', alt:true, fn:() => { NET.state = 'lobby'; olPublishLobby(); showOnline(); } }, { label:'Leave match', ghost:true, fn:olLeave }]
       : [{ label:'Match lobby', alt:true, fn:showOnline }, { label:'Leave match', ghost:true, fn:olLeave }] });
 }
 function netQuitMatch() {
-  if (NET.role === 'host') { NET.state = 'lobby'; NET.log = false; game = null; stageMode = null; olPublishLobby(); showOnline(); }
+  if (NET.role === 'host') { NET.state = 'lobby'; NET.log = false; olEndLocal(); stageMode = null; olPublishLobby(); showOnline(); }
   else { olLeave(); }
+}
+
+/* ---- Online Bullet Bash: the creator shoots in the left panel, the friend in the right ---- */
+const olNum = (v, a, b) => typeof v === 'number' && Number.isFinite(v) ? clamp(v, a, b) : a;
+const olStr = (v, n = 40) => typeof v === 'string' ? v.slice(0, n) : '';
+const r1 = v => Math.round(v * 10) / 10;
+function netHostStartBash(them) {
+  startBash(NET.hero, them, 'online', 1);
+  bash.players[1].ctrl = 'net'; bash.online = 'host'; bash.me = 0;
+  NET.log = true; NET.rec = [];
+  setStage('bash'); $('#hint').innerHTML = '<b>Online Bullet Bash</b> · you shoot in the LEFT panel · <b>Aim</b> mouse or WASD / arrows · <b>Shoot</b> click, tap or Space · <b>Leave</b> Q';
+}
+// The friend's aim (absolute) and shot counter -> player 2 on the host.
+function netBashInput(pl) {
+  const o = NET.opp && NET.opp.presence && NET.opp.presence.in; if (!o || typeof o !== 'object') return false;
+  if (typeof o.ax === 'number' && Number.isFinite(o.ax)) pl.aimX = o.ax;
+  if (typeof o.ay === 'number' && Number.isFinite(o.ay)) pl.aimY = o.ay;
+  const L = NET.lastIn, shot = typeof o.f === 'number' && o.f > L.f; if (typeof o.f === 'number') L.f = o.f;
+  return shot && bash.phase === 'play';
+}
+function olBashSnap() {
+  const b = bash;
+  return { ph:b.phase, pt:r1(b.phaseT), ck:r1(b.clock), tm:r1(b.time), sh:Math.round(b.shake || 0), tw:b.twist.id,
+    pl:b.players.map(p => [p.score, Math.round(p.aimX), Math.round(p.aimY), p.streak || 0, p.best || 0, p.hits, p.shots, r1(p.shooter.recoil || 0)]),
+    tg:b.targets.slice(0, 24).map(t => [t.owner, t.kind, Math.round(t.x), Math.round(t.y), Math.round(t.s * 100) / 100, t.state, r1(t.rot), r1(t.t), t.hp || 0, r1(t.hitFlash || 0)]),
+    bl:b.bullets.slice(0, 16).map(l => [l.owner, l.kind, Math.round(l.x), Math.round(l.y), Math.round(l.ang * 100) / 100, Math.round(l.sc * 100) / 100, r1(l.t), l.color]) };
+}
+function netGuestStartBash(hp) {
+  const them = olCleanHero(hp.hero), me = NET.hero;
+  NET.match = hp.m; NET.state = 'play'; NET.result = null; NET.applied = hp.fx && hp.fx.length ? hp.fx[hp.fx.length - 1][0] : 0;
+  startBash(them, me, 'online', 1);
+  const b = bash; b.online = 'guest'; b.me = 1; b.players[0].ctrl = 'net'; b.players[1].ctrl = 'you';
+  b.twist = TWISTS.find(t => t.id === (hp.sn && hp.sn.tw)) || TWISTS[0]; b.lcool = 0;
+  setStage('netbash'); $('#hint').innerHTML = '<b>Online Bullet Bash</b> · you shoot in the RIGHT panel · <b>Aim</b> mouse or WASD / arrows · <b>Shoot</b> click, tap or Space · <b>Leave</b> Q';
+}
+function netGuestBashStep(raw) {
+  const b = bash, me = b.players[1], dt = raw; updateFx(raw);
+  // my own crosshair moves right away on this screen; the host gets it through presence
+  const kx = (anyHeld(['KeyD', 'ArrowRight']) ? 1 : 0) - (anyHeld(['KeyA', 'ArrowLeft']) ? 1 : 0), ky = (anyHeld(['KeyS', 'ArrowDown']) ? 1 : 0) - (anyHeld(['KeyW', 'ArrowUp']) ? 1 : 0);
+  me.aimX += kx * 600 * dt; me.aimY += ky * 600 * dt; clampAim(me);
+  b.lcool = Math.max(0, (b.lcool || 0) - dt);
+  const fire = anyPressed(['Space', 'KeyF', 'KeyJ', 'Enter']) || b.clickQueued; b.clickQueued = false; pressed.clear();
+  const m = NET.myIn, next = { ...m, ax:Math.round(me.aimX), ay:Math.round(me.aimY) };
+  if (fire && b.lcool <= 0 && b.phase === 'play') { next.f = (m.f || 0) + 1; b.lcool = .28; }
+  if (next.ax !== m.ax || next.ay !== m.ay || next.f !== m.f) { NET.myIn = next; NET.room.presence({ in:next }).catch(() => {}); }
+  // the host's world
+  const hp = NET.opp && NET.opp.presence;
+  if (hp && hp.g === 'bash' && hp.m === NET.match && hp.sn && typeof hp.sn === 'object') {
+    const sn = hp.sn;
+    if (['intro', 'play', 'over'].includes(sn.ph)) b.phase = sn.ph;
+    b.phaseT = olNum(sn.pt, 0, 99); b.clock = olNum(sn.ck, 0, 999); b.time = olNum(sn.tm, 0, 9999); b.shake = olNum(sn.sh, 0, 30);
+    (Array.isArray(sn.pl) ? sn.pl : []).slice(0, 2).forEach((a, i) => {
+      if (!Array.isArray(a)) return; const pl = b.players[i];
+      pl.score = olNum(a[0], 0, 1e7); pl.streak = olNum(a[3], 0, 999); pl.best = olNum(a[4], 0, 999); pl.hits = olNum(a[5], 0, 1e5); pl.shots = olNum(a[6], 0, 1e5);
+      pl.shooter.recoil = olNum(a[7], 0, 1);
+      if (i !== 1) { pl.aimX += (olNum(a[1], 0, W) - pl.aimX) * Math.min(1, raw * 18); pl.aimY += (olNum(a[2], 0, H) - pl.aimY) * Math.min(1, raw * 18); }
+    });
+    b.targets = (Array.isArray(sn.tg) ? sn.tg : []).slice(0, 24).filter(a => Array.isArray(a) && TKIND[a[1]]).map(a => ({ owner:a[0] ? 1 : 0, kind:a[1], x:olNum(a[2], -200, W + 200), y:olNum(a[3], -200, H + 200),
+      s:olNum(a[4], .1, 2), state:olStr(a[5], 8), rot:olNum(a[6], -999, 999), t:olNum(a[7], 0, 99), hp:olNum(a[8], 0, 9), hitFlash:olNum(a[9], 0, 1) }));
+    b.bullets = (Array.isArray(sn.bl) ? sn.bl : []).slice(0, 16).filter(a => Array.isArray(a) && BASH_SHOT[a[1]]).map(a => {
+      const bl = { owner:a[0] ? 1 : 0, kind:a[1], x:olNum(a[2], -200, W + 200), y:olNum(a[3], -200, H + 200), ang:olNum(a[4], -7, 7), sc:olNum(a[5], 0, 2), t:olNum(a[6], 0, 99), color:olStr(a[7], 24) || PAPER };
+      bl.dir = Math.cos(bl.ang) >= 0 ? 1 : -1; emitTrail(bl, bl.x, bl.y, raw); return bl;
+    });
+    if (Array.isArray(hp.fx)) for (const e of hp.fx) if (Array.isArray(e) && e[0] > NET.applied) { NET.applied = e[0]; try { olReplay(e); } catch (err) {} }
+  }
+  // the shooters turn toward their crosshairs, as in bashStep
+  b.players.forEach(pl => {
+    const sh = pl.shooter, k = (sh.hero.size || 1) * sh.ds, dx = pl.aimX - sh.x;
+    sh.facing = dx >= 0 ? 1 : -1;
+    sh.aimA = Math.atan2(pl.aimY - (sh.y - 112 * k), Math.max(8, Math.abs(dx - sh.facing * 6 * k)));
+    sh.anim += dt; sh.t += dt;
+  });
+}
+function netBashOver() {
+  const b = bash, [p1, p2] = b.players, w = p1.score === p2.score ? -1 : p1.score > p2.score ? 0 : 1, sc = [p1.score, p2.score];
+  NET.state = 'result'; NET.result = w; NET.log = false;
+  NET.room.presence({ st:'result', w, g:'bash', sc, sn:null, fx:null }).catch(() => {});
+  olShowResult(w === -1 ? null : w === 0, p1.hero, p2.hero, true, 'bash', sc);
+}
+
+/* ---- Online Gloom Tower Race: two racers on one freshly shuffled board ---- */
+const BD_TYPE_IDS = ['plain', 'start', 'finish', 'zip', 'trap', 'swap', 'net', 'boost', 'card', 'duel', 'shield', 'zap'];
+const olLayout = () => BD_SPACES.map(s => s.to !== undefined ? `${s.type}:${s.to}` : s.type).join(',');
+function olReadLayout(str) {
+  if (typeof str !== 'string' || str.length > 2000) return null;
+  const parts = str.split(','); if (parts.length !== BD_LAST + 1) return null;
+  const t = parts.map(p => { const [ty, to] = p.split(':'); if (!BD_TYPE_IDS.includes(ty)) return null; const s = { type:ty };
+    if (ty === 'zip' || ty === 'trap') { const n = parseInt(to, 10); if (!(n >= 0 && n <= BD_LAST)) return null; s.to = n; } return s; });
+  return t.every(Boolean) && t[0].type === 'start' && t[BD_LAST].type === 'finish' ? t : null;
+}
+function netHostStartBoard(them) {
+  startBoard([{ ctrl:'human', heroObj:NET.hero }, { ctrl:'net', heroObj:them }], 'online');
+  board.online = 'host'; board.me = 0;
+  NET.log = true; NET.rec = []; NET.layout = olLayout();
+  setStage('board'); $('#hint').innerHTML = '<b>Online Gloom Tower Race</b> · <b>Spin</b> Space, Enter or click on your turn · <b>Skip a message</b> Space · <b>Leave</b> Q';
+}
+// The friend's spin / skip presses and POWER choice -> the host's board.
+function netBoardInput() {
+  const o = NET.opp && NET.opp.presence && NET.opp.presence.in, L = NET.lastIn; if (!o || typeof o !== 'object') return null;
+  const r = { press:typeof o.sp === 'number' && o.sp > L.sp, go:typeof o.go === 'number' && o.go > L.go, sel:o.sel ? 1 : 0 };
+  if (typeof o.sp === 'number') L.sp = o.sp; if (typeof o.go === 'number') L.go = o.go;
+  return r;
+}
+function olBoardSnap() {
+  const S = board, idx = P => P ? P.idx : -1, a = S.act;
+  let act = 0;
+  if (a && a.type === 'duel' && a.show) act = ['d', idx(a.a), idx(a.b), a.show[0], a.show[1]];
+  else if (a && a.type === 'zap' && a.bolt) act = ['z', Math.round(a.bolt.x), Math.round(a.bolt.y), a.bolt.kind, a.bolt.color, a.bolt.dir];
+  return { lay:NET.layout, tn:S.turn, ph:S.phase, pt:Math.round(S.phaseT * 100) / 100, wa:Math.round(S.wheelA * 100) / 100, ww:S.wheelW.map(w => Math.round(w * 100) / 100),
+    ld:S.landing || null, rd:S.rounds, wn:idx(S.winner), sh:Math.round(S.shake || 0),
+    pl:S.players.map(P => [P.pos, P.shield ? 1 : 0, P.skip ? 1 : 0, P.hop ? [P.hop.from, P.hop.to, Math.round(P.hop.t * 100) / 100, P.hop.dur, P.hop.style] : 0]),
+    msg:S.msg ? [S.msg.title, S.msg.text, S.msg.col, Math.round(S.msg.t * 100) / 100] : 0,
+    ch:S.phase === 'choose' && S.choice ? [idx(S.choice.p), idx(S.choice.t), S.choice.sel] : 0, act };
+}
+function netGuestStartBoard(hp) {
+  const lay = olReadLayout(hp.sn && hp.sn.lay); if (!lay) return;
+  const them = olCleanHero(hp.hero), me = NET.hero;
+  NET.match = hp.m; NET.state = 'play'; NET.result = null; NET.applied = hp.fx && hp.fx.length ? hp.fx[hp.fx.length - 1][0] : 0;
+  BD_SPACES = lay; BD_BG = buildBoardBg(); NET.layout = hp.sn.lay;
+  const players = [them, me].map((h, k) => ({ idx:k, slot:k, ctrl:k ? 'you' : 'net', hero:h, pos:0, shield:false, skip:false, extra:false, hop:null }));
+  board = Object.assign(newFx(), { origin:'online', online:'guest', me:1, players, turn:0, phase:'intro', phaseT:0, time:0, paused:false, queue:[], act:null,
+    wheelA:-Math.PI / 2 - Math.PI / 8, wheelV:0, wheelW:bdWeights(0), wheelTarget:bdWeights(0), tilt:0, spinResult:null, msg:null, winner:null, cpuT:0, clickQueued:false, rounds:1, choice:null, landing:null });
+  FX = board; setStage('netboard'); setTouch('board');
+  $('#hint').innerHTML = '<b>Online Gloom Tower Race</b> · <b>Spin</b> Space, Enter or click on your turn · <b>Skip a message</b> Space · <b>Leave</b> Q';
+}
+function netGuestBoardStep(raw) {
+  const S = board; S.time += raw; updateFx(raw);
+  const hp = NET.opp && NET.opp.presence;
+  if (hp && hp.g === 'board' && hp.m === NET.match && hp.sn && typeof hp.sn === 'object') {
+    const sn = hp.sn, P = i => S.players[i] || null;
+    if (sn.lay !== NET.layout) { const lay = olReadLayout(sn.lay); if (lay) { BD_SPACES = lay; BD_BG = buildBoardBg(); NET.layout = sn.lay; } }
+    if (['intro', 'turnStart', 'await', 'spinning', 'resolve', 'choose', 'won'].includes(sn.ph)) S.phase = sn.ph;
+    S.turn = sn.tn === 1 ? 1 : 0; S.phaseT = olNum(sn.pt, 0, 99); S.wheelA = olNum(sn.wa, -1e4, 1e4); S.rounds = olNum(sn.rd, 1, 999); S.shake = olNum(sn.sh, 0, 30);
+    if (Array.isArray(sn.ww) && sn.ww.length === BD_WHEEL.length) S.wheelW = sn.ww.map(w => olNum(w, .05, 9));
+    S.landing = Array.isArray(sn.ld) && sn.ld.length === 6 && sn.ld.every(t => BD_TYPES[t] || t === 'finish') ? sn.ld.slice() : null;
+    S.winner = P(sn.wn);
+    (Array.isArray(sn.pl) ? sn.pl : []).slice(0, 2).forEach((a, i) => {
+      if (!Array.isArray(a)) return; const p = S.players[i];
+      p.pos = Math.round(olNum(a[0], 0, BD_LAST)); p.shield = !!a[1]; p.skip = !!a[2];
+      const h = a[3];
+      p.hop = Array.isArray(h) ? { from:Math.round(olNum(h[0], 0, BD_LAST)), to:Math.round(olNum(h[1], 0, BD_LAST)), t:olNum(h[2], 0, 5), dur:olNum(h[3], .05, 5), style:['hop', 'zip', 'trap', 'swap'].includes(h[4]) ? h[4] : 'hop' } : null;
+    });
+    const m = sn.msg;
+    if (Array.isArray(m)) { if (!S.msg || S.msg.title !== olStr(m[0], 60) || S.msg.text !== olStr(m[1], 240)) S.msg = { title:olStr(m[0], 60), text:olStr(m[1], 240), col:olStr(m[2], 24) || POW, t:0 }; S.msg.t = olNum(m[3], 0, 30); }
+    else S.msg = null;
+    const ch = sn.ch;
+    if (Array.isArray(ch) && P(ch[0]) && P(ch[1])) {
+      const mine = ch[0] === S.me;
+      if (!S.choice || S.choice.p !== P(ch[0])) S.choice = { p:P(ch[0]), t:P(ch[1]), sel:mine ? (NET.myIn.sel || 0) : 0 };
+      if (!mine) S.choice.sel = ch[2] ? 1 : 0;
+    } else S.choice = null;
+    const a = sn.act;
+    S.act = Array.isArray(a) && a[0] === 'd' && P(a[1]) && P(a[2]) ? { type:'duel', a:P(a[1]), b:P(a[2]), show:[olNum(a[3], 1, 6), olNum(a[4], 1, 6)] }
+      : Array.isArray(a) && a[0] === 'z' ? { type:'zap', bolt:{ x:olNum(a[1], -200, W + 200), y:olNum(a[2], -200, H + 200), kind:olStr(a[3], 16), color:olStr(a[4], 24) || POW, dir:a[5] < 0 ? -1 : 1 } } : null;
+    if (S.act && S.act.type === 'zap') emitTrail(S.act.bolt, S.act.bolt.x, S.act.bolt.y, raw);
+    if (Array.isArray(hp.fx)) for (const e of hp.fx) if (Array.isArray(e) && e[0] > NET.applied) { NET.applied = e[0]; try { olReplay(e); } catch (err) {} }
+  }
+  // my presses: spin / skip, or pick and confirm on my POWER choice
+  const m = NET.myIn, next = { ...m };
+  if (S.phase === 'choose' && S.choice && S.choice.p.idx === S.me) {
+    const ch = S.choice; let go = anyPressed(['Space', 'Enter', 'KeyF', 'Digit1', 'Digit2']);
+    if (anyPressed(['ArrowLeft', 'KeyA', 'Digit1'])) ch.sel = 0;
+    if (anyPressed(['ArrowRight', 'KeyD', 'Digit2'])) ch.sel = 1;
+    if (S.clickQueued && S.clickPos) { const [mx, my] = S.clickPos; BD_CHOICE_BTNS.forEach(([bx, by, bw, bh], i) => { if (mx >= bx && mx <= bx + bw && my >= by && my <= by + bh) { ch.sel = i; go = true; } }); }
+    next.sel = ch.sel; if (go) next.go = (m.go || 0) + 1;
+  } else if (anyPressed(['Space', 'Enter', 'KeyF', 'KeyJ']) || S.clickQueued) next.sp = (m.sp || 0) + 1;
+  S.clickQueued = false; pressed.clear();
+  if (next.sp !== m.sp || next.go !== m.go || next.sel !== m.sel) { NET.myIn = next; NET.room.presence({ in:next }).catch(() => {}); }
+}
+function netBoardOver() {
+  const S = board, w = S.winner ? S.winner.idx : -1, sc = S.players.map(P => P.pos);
+  NET.state = 'result'; NET.result = w; NET.log = false;
+  NET.room.presence({ st:'result', w, g:'board', sc, sn:null, fx:null }).catch(() => {});
+  olShowResult(w === -1 ? null : w === 0, S.players[0].hero, S.players[1].hero, true, 'board', sc);
 }
 // Runs every frame while in an online match room.
 function netTick(raw) {
@@ -8364,28 +8588,42 @@ function netTick(raw) {
     const them = opp && opp.presence && opp.presence.hero ? olCleanHero(opp.presence.hero) : null, key = them ? them.id + them.suit + them.name : '';
     if (key !== NET.oppKey) { NET.oppKey = key; $('#olThemName').textContent = them ? them.name : 'Waiting…'; const tc = $('#olThemCv'); if (them) olDrawHero(tc, them); else tc.getContext('2d').clearRect(0, 0, tc.width, tc.height); }
     $('#olGo').hidden = !(NET.role === 'host' && them);
-    if (NET.role === 'guest') olMsg(opp ? 'Connected! Waiting for the host to start the match.' : 'Waiting for the host… (check the code)');
-    else olMsg(them ? `${them.name} is here! Press Start when you’re both ready.` : 'Tell your friend this code. When they join, press Start.');
+    const hg = opp && opp.presence && OL_GAMES.some(g => g[0] === opp.presence.g) ? opp.presence.g : null;
+    if (NET.role === 'guest' && hg && hg !== NET.game) { NET.game = hg; $('#olGames').querySelectorAll('.chip').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.g === hg))); }
+    const st = NET.room.status ? NET.room.status() : 'looking';
+    if (NET.role === 'guest') olMsg(opp ? `Connected! The host picked ${olGameName(hg || 'fight')}. Waiting for them to start.`
+      : st === 'nohost' ? `No match called ${NET.code} right now. Check the code, and make sure the other player has pressed Create match and is still on that screen. Still trying…`
+      : st === 'slow' ? 'Found the match but can’t reach the other device yet. Still trying… If this keeps up, the network may be blocking direct game connections (common on school Wi-Fi). Try both devices on home Wi-Fi or a phone hotspot.'
+      : `Looking for match ${NET.code}…`);
+    else olMsg(them ? `${them.name} is here! Pick a game, then press Start when you’re both ready.` : 'Tell your friend this code. When they join, press Start.');
   }
   if (NET.role === 'host') {
-    if (game && game.online === 'host' && stageMode === 'fight') {
-      if (NET.oppGone > 4) { NET.log = false; NET.state = 'lobby'; game = null; stageMode = null; showOnline(); toast('Your opponent left the match.'); olPublishLobby(); return; }
-      NET.room.presence({ role:'host', st:'play', m:NET.match, ar:NET.arena, g:NET.game, sn:olSnapshot(), fx:NET.rec.slice(-16) }).catch(() => {});
+    const hs = olHosting();
+    if (hs) {
+      if (NET.oppGone > 4) { NET.log = false; NET.state = 'lobby'; olEndLocal(); stageMode = null; showOnline(); toast('Your opponent left the match.'); olPublishLobby(); return; }
+      const sn = hs === 'bash' ? olBashSnap() : hs === 'board' ? olBoardSnap() : olSnapshot();
+      NET.room.presence({ role:'host', st:'play', m:NET.match, ar:NET.arena, g:hs, sn, fx:NET.rec.slice(-16) }).catch(() => {});
     }
   } else if (NET.role === 'guest' && opp) {
     const hp = opp.presence;
-    if (hp.st === 'play' && hp.m && hp.m !== NET.match && hp.sn) netGuestStartFight(hp);
-    else if (hp.st === 'result' && NET.state === 'play' && hp.m === NET.match) { NET.state = 'result'; olShowResult(hp.w === 1, NET.hero, olCleanHero(hp.hero), false); }
-    else if (hp.st === 'lobby' && NET.state === 'play' && game && game.online === 'guest') { NET.state = 'lobby'; game = null; stageMode = null; showOnline(); toast('The host went back to the match lobby.'); }
-  } else if (NET.role === 'guest' && !opp && NET.oppGone > 4 && game && game.online === 'guest') {
-    NET.state = 'lobby'; game = null; stageMode = null; showOnline(); toast('The host left the match.');
+    if (hp.st === 'play' && hp.m && hp.m !== NET.match && hp.sn && typeof hp.sn === 'object') {
+      if (hp.g === 'bash') netGuestStartBash(hp); else if (hp.g === 'board') netGuestStartBoard(hp); else netGuestStartFight(hp);
+    }
+    else if (hp.st === 'result' && NET.state === 'play' && hp.m === NET.match) {
+      NET.state = 'result';
+      const g = ['bash', 'board'].includes(hp.g) ? hp.g : 'fight', sc = Array.isArray(hp.sc) && hp.sc.length === 2 ? hp.sc.map(v => olNum(v, 0, 1e7)) : null;
+      olShowResult(hp.w === -1 ? null : hp.w === 1, NET.hero, olCleanHero(hp.hero), false, g, sc);
+    }
+    else if (hp.st === 'lobby' && NET.state === 'play' && olGuesting()) { NET.state = 'lobby'; olEndLocal(); stageMode = null; showOnline(); toast('The host went back to the match lobby.'); }
+  } else if (NET.role === 'guest' && !opp && NET.oppGone > 4 && olGuesting()) {
+    NET.state = 'lobby'; olEndLocal(); stageMode = null; showOnline(); toast('The host left the match.');
   }
 }
 $('#modeOnline').addEventListener('click', () => { audioInit(); if (!NET.room) $('#olStatus').textContent = 'One player creates a match and gets a 4-letter code. The other player types that code to join.'; showOnline(); });
 $('#olHeroBtn').addEventListener('click', () => openSelect('online'));
 $('#olCreate').addEventListener('click', () => { audioInit(); let c = ''; for (let i = 0; i < 4; i++) c += OL_LETTERS[Math.floor(Math.random() * OL_LETTERS.length)]; olEnter('host', c); });
 $('#olJoinForm').addEventListener('submit', e => { e.preventDefault(); audioInit(); const c = $('#olCode').value.toUpperCase().replace(/[^A-Z]/g, ''); if (c.length !== 4) { $('#olStatus').textContent = 'Match codes are 4 letters.'; return; } olEnter('guest', c); });
-$('#olGo').addEventListener('click', () => { audioInit(); netHostStartFight(); });
+$('#olGo').addEventListener('click', () => { audioInit(); netHostStart(); });
 $('#olLeave').addEventListener('click', olLeave);
 $('#olBack').addEventListener('click', () => { if (NET.room) olLeave().then(() => show('title')); else show('title'); });
 
@@ -8966,7 +9204,7 @@ function showResultScreen(o) {
 }
 function quitToMenu() { game = null; bash = null; smash = null; puzzle = null; board = null; hol = null; stageMode = null; show('title'); }
 function quitStage() {
-  if (game && game.online && (stageMode === 'fight' || stageMode === 'netfight')) { netQuitMatch(); return; }
+  { const S = current(); if (S && S.online) { netQuitMatch(); return; } }
   if (stageMode === 'puzzle') { showPuzzleLevels(); return; }
   if (stageMode === 'holiday') { const o = hol && hol.origin; hol = null; stageMode = null; if (o === 'world' && world) returnToWorld(0); else showHolidayMenu('menu'); return; }
   if (stageMode === 'world') { world.paused = false; stageMode = null; show('title'); return; }
@@ -9051,8 +9289,8 @@ document.addEventListener('selectstart', e => { if (screen === 'stage') e.preven
 $('#screen-stage').addEventListener('contextmenu', e => e.preventDefault());
 
 function canvasPoint(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * W, clamp((e.clientY - r.top) / r.height * H, 30, AIM_MAX_Y)]; }
-cv.addEventListener('pointermove', e => { if (stageMode === 'bash' && bash) [bash.players[0].aimX, bash.players[0].aimY] = canvasPoint(e); });
-cv.addEventListener('pointerdown', e => { if (stageMode === 'board' && board && !board.paused) { e.preventDefault(); audioInit(); board.clickQueued = true; board.clickPos = pzPoint(e); } });
+cv.addEventListener('pointermove', e => { if ((stageMode === 'bash' || stageMode === 'netbash') && bash) { const pl = bash.players[bash.me || 0]; [pl.aimX, pl.aimY] = canvasPoint(e); } });
+cv.addEventListener('pointerdown', e => { if ((stageMode === 'board' || stageMode === 'netboard') && board && !board.paused) { e.preventDefault(); audioInit(); board.clickQueued = true; board.clickPos = pzPoint(e); } });
 // Gloom Topple: drag back like a slingshot, let go to fire; a tap mid-flight triggers the ability.
 cv.addEventListener('pointerdown', e => {
   if (stageMode !== 'puzzle' || !puzzle || puzzle.paused) return;
@@ -9075,9 +9313,9 @@ const pzRelease = e => {
 cv.addEventListener('pointerup', pzRelease);
 cv.addEventListener('pointercancel', () => { if (puzzle) puzzle.drag = null; });
 cv.addEventListener('pointerdown', e => {
-  if (stageMode !== 'bash' || !bash) return;
+  if ((stageMode !== 'bash' && stageMode !== 'netbash') || !bash) return;
   e.preventDefault(); audioInit();
-  [bash.players[0].aimX, bash.players[0].aimY] = canvasPoint(e);
+  { const pl = bash.players[bash.me || 0]; [pl.aimX, pl.aimY] = canvasPoint(e); }
   if (bash.paused) return;
   bash.clickQueued = true;
 });
