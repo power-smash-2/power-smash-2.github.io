@@ -8147,64 +8147,117 @@ function mockRoomLib() {
       leave:async () => { alive = false; clearInterval(hb); try { ch.postMessage({ peer:me, leave:true }); ch.close(); } catch (e) {} } };
   } };
 }
-// Off claude.ai (for example on GitHub Pages) the two devices connect directly with PeerJS, loaded on demand.
-// The creator registers the match code with the free PeerJS server; the friend connects to that code. Same
-// presence-style interface as the claude.ai room, so the rest of online play doesn't care which one is in use.
+// Off claude.ai (for example on GitHub Pages) the two devices find each other two ways at once:
+//  - DIRECT: PeerJS (loaded on demand). The creator registers the match code with the free PeerJS server and the
+//    friend connects straight to that device. Fastest, but some routers and networks won't let two devices link up.
+//  - RELAY: both devices also join a topic named after the match code on free public message servers (MQTT over
+//    secure WebSockets). Whenever the direct link isn't open, updates go through the relay instead.
+// Same presence-style interface as the claude.ai room, so the rest of online play doesn't care which one is in use.
+// Everything received is treated as untrusted: only plain objects, size-limited, and from the other role.
 const PEERJS_URL = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', PEER_PREFIX = 'pwrsmash7-';
-function loadPeerJs() {
+const MQTT_URL = 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
+const RELAYS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+function loadLib(url, global) {
   return new Promise((res, rej) => {
-    if (window.Peer) return res(window.Peer);
-    const s = document.createElement('script'); s.src = PEERJS_URL; s.async = true;
-    s.onload = () => window.Peer ? res(window.Peer) : rej(new Error('load')); s.onerror = () => rej(new Error('load'));
+    if (window[global]) return res(window[global]);
+    const s = document.createElement('script'); s.src = url; s.async = true;
+    s.onload = () => window[global] ? res(window[global]) : rej(new Error('load')); s.onerror = () => rej(new Error('load'));
     document.head.appendChild(s);
   });
 }
+const loadPeerJs = () => loadLib(PEERJS_URL, 'Peer');
 function peerRoomLib() {
   return { async join(name, role) {
-    const Peer = await loadPeerJs(), hostId = PEER_PREFIX + name;
-    let mine = {}, theirs = null, theirsAt = 0, conn = null, alive = true, sendT = null;
-    const subs = new Set();
-    const live = () => !!(conn && conn.open && theirs && Date.now() - theirsAt < 5000);
+    const hostId = PEER_PREFIX + name, topic = 'pwrsmash7/v1/' + name, me = Math.random().toString(36).slice(2, 12);
+    const want = role === 'host' ? 'guest' : 'host', noP2P = /relayonly/.test(location.search), noRelay = /p2ponly/.test(location.search);
+    let mine = {}, theirs = null, theirsAt = 0, theirsFrom = null, theirsQ = -1, q = 0, conn = null, alive = true, sendT = null, peer = null, lastRelayAt = 0;
+    const subs = new Set(), relays = [];
+    const live = () => !!(theirs && Date.now() - theirsAt < 5000);
+    const direct = () => !!(conn && conn.open);
     const peersArr = () => { const a = [{ peer:'me', isMe:true, sameTab:true, by:null, kind:'viewer', guest:false, presence:mine, updatedAt:Date.now() }];
       if (live()) a.push({ peer:'them', isMe:false, sameTab:false, by:null, kind:'viewer', guest:false, presence:theirs, updatedAt:theirsAt }); return a; };
     const notify = () => subs.forEach(fn => { try { fn({ peers:peersArr(), joined:[], left:[], updated:[] }); } catch (e) {} });
-    const send = () => { if (conn && conn.open) try { conn.send({ presence:mine }); } catch (e) {} };
+    // Accept an update from the other player (newest first; a restarted sender is accepted after a short gap).
+    const accept = d => {
+      if (!d || typeof d !== 'object' || typeof d.from !== 'string' || d.from === me) return;
+      const p = d.presence; if (!p || typeof p !== 'object' || Array.isArray(p) || p.role !== want) return;
+      const n = typeof d.q === 'number' ? d.q : 0;
+      if (d.from === theirsFrom && n <= theirsQ) return;
+      if (d.from !== theirsFrom && theirs && Date.now() - theirsAt < 3000) return; // someone else is already playing here
+      theirsFrom = d.from; theirsQ = n; theirs = p; theirsAt = Date.now(); notify();
+    };
+    const send = () => {
+      const pkt = { from:me, q:++q, presence:mine };
+      if (direct()) { try { conn.send(pkt); } catch (e) {} return; }
+      const s = JSON.stringify(pkt); if (s.length > 12000) return;
+      lastRelayAt = Date.now();
+      relays.forEach(c => { if (c.connected) try { c.publish(topic, s, { qos:0 }); } catch (e) {} });
+    };
     const attach = c => {
       if (conn && conn !== c && conn.open) { try { c.close(); } catch (e) {} return; } // one opponent per match
       conn = c;
       c.on('open', () => { send(); notify(); });
-      c.on('data', d => { if (d && typeof d === 'object' && d.presence && typeof d.presence === 'object' && !Array.isArray(d.presence)) { theirs = d.presence; theirsAt = Date.now(); notify(); } });
-      c.on('close', () => { if (conn === c) { conn = null; theirs = null; notify(); } });
+      c.on('data', accept);
+      c.on('close', () => { if (conn === c) { conn = null; notify(); } });
       c.on('error', () => {});
     };
-    const peer = await new Promise((res, rej) => {
+    // Relay: connect to every relay server; publish to all that are up, listen on all.
+    const relayReady = noRelay ? Promise.resolve(false) : loadLib(MQTT_URL, 'mqtt').then(m => {
+      RELAYS.forEach((url, i) => { try {
+        const c = m.connect(url, { clientId:`ps_${me}_${i}`, clean:true, connectTimeout:8000, reconnectPeriod:4000, keepalive:30 });
+        c.on('connect', () => { try { c.subscribe(topic, { qos:0 }); } catch (e) {} send(); });
+        c.on('message', (t, buf) => { if (!alive || t !== topic || !buf || buf.length > 12000) return; let d; try { d = JSON.parse(buf.toString()); } catch (e) { return; } accept(d); });
+        c.on('error', () => {});
+        relays.push(c);
+      } catch (e) {} });
+      return true;
+    }).catch(() => false);
+    // Direct: register (host) or open (friend) a PeerJS connection. If the PeerJS service can't be reached, carry on with the relay.
+    const peerReady = noP2P ? Promise.resolve(null) : loadPeerJs().then(Peer => new Promise(res => {
       const p = role === 'host' ? new Peer(hostId) : new Peer();
-      const t = setTimeout(() => { rej(new Error('timeout')); try { p.destroy(); } catch (e) {} }, 15000);
+      const t = setTimeout(() => { res(null); try { p.destroy(); } catch (e) {} }, 12000);
       p.on('open', () => { clearTimeout(t); res(p); });
-      p.on('error', e => { clearTimeout(t); rej(e); });
-    });
+      p.on('error', e => { clearTimeout(t); res(e && e.type === 'unavailable-id' ? 'taken' : null); try { p.destroy(); } catch (e2) {} });
+    })).catch(() => null);
+    const [relayOk, pr] = await Promise.all([relayReady, peerReady]);
+    if (pr === 'taken') { relays.forEach(c => { try { c.end(true); } catch (e) {} }); const e = new Error('taken'); e.type = 'unavailable-id'; throw e; }
+    if (!relayOk && !pr) throw new Error('load');
+    peer = pr;
     // What the friend's screen shows while connecting: 'looking', 'nohost' (no match with that code yet), 'slow', 'ok'.
-    let stage = role === 'host' ? 'ok' : 'looking', triedAt = 0, startAt = Date.now();
-    peer.on('error', e => { if (e && e.type === 'peer-unavailable') { stage = 'nohost'; conn = null; triedAt = Date.now(); } });
-    peer.on('disconnected', () => { if (alive) try { peer.reconnect(); } catch (e) {} });
-    if (role === 'host') peer.on('connection', attach);
-    // A connection between two real devices can take several seconds to set up, so an attempt gets 10 s before a retry.
+    let stage = role === 'host' ? 'ok' : 'looking', triedAt = 0;
+    const startAt = Date.now();
+    if (peer) {
+      peer.on('error', e => { if (e && e.type === 'peer-unavailable') { if (!live()) stage = 'nohost'; conn = null; triedAt = Date.now(); } });
+      peer.on('disconnected', () => { if (alive) try { peer.reconnect(); } catch (e) {} });
+      if (role === 'host') peer.on('connection', attach);
+    }
+    // A direct connection between two devices can take several seconds to set up, so an attempt gets 10 s before a retry.
     const tryConnect = () => {
-      if (!alive || role === 'host' || (conn && conn.open)) return;
+      if (!alive || !peer || role === 'host' || direct()) return;
       if (conn && Date.now() - triedAt < 10000) return;
+      if (!conn && Date.now() - triedAt < 3000) return;
       if (conn) { try { conn.close(); } catch (e) {} conn = null; }
       triedAt = Date.now(); attach(peer.connect(hostId, { reliable:true }));
     };
     tryConnect();
-    // keep-alive: re-send presence every second, reconnect if needed, and drop an opponent who went quiet
-    const hb = setInterval(() => { if (!alive) return; send();
-      if (role !== 'host') { if (conn && conn.open) stage = 'ok'; else { if (stage !== 'nohost' && Date.now() - startAt > 12000) stage = 'slow'; if (!conn && stage === 'nohost' && Date.now() - triedAt < 3000) return; tryConnect(); } }
-      if (theirs && Date.now() - theirsAt > 5000) { theirs = null; notify(); } }, 1000);
-    return { name, peers:peersArr, connected:() => !!(conn && conn.open), status:() => stage,
+    // keep-alive: re-send presence every second, keep trying the direct link, and drop an opponent who went quiet
+    const hb = setInterval(() => {
+      if (!alive) return; send();
+      if (role !== 'host') {
+        if (live()) stage = 'ok';
+        else if (stage !== 'nohost' && Date.now() - startAt > 12000) stage = 'slow';
+        tryConnect();
+      }
+      if (theirs && Date.now() - theirsAt > 5000) { theirs = null; notify(); }
+    }, 1000);
+    return { name, peers:peersArr, connected:() => direct() || relays.some(c => c.connected), status:() => live() ? 'ok' : stage,
+      route:() => direct() ? 'direct' : 'relay',
       presence:async patch => { mine = { ...mine }; for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
-        if (!sendT) sendT = setTimeout(() => { sendT = null; send(); }, 33); }, // about 30 updates a second, like the claude.ai room
+        // about 30 updates a second over the direct link, about 15 through the relay servers
+        if (!sendT) sendT = setTimeout(() => { sendT = null; send(); }, direct() ? 33 : Math.max(16, 66 - (Date.now() - lastRelayAt))); },
       onPeers:fn => { subs.add(fn); setTimeout(() => fn({ peers:peersArr(), joined:[], left:[], updated:[] }), 0); return () => subs.delete(fn); },
-      leave:async () => { alive = false; clearInterval(hb); clearTimeout(sendT); try { if (conn) conn.close(); } catch (e) {} try { peer.destroy(); } catch (e) {} } };
+      leave:async () => { alive = false; clearInterval(hb); clearTimeout(sendT); try { if (conn) conn.close(); } catch (e) {} try { if (peer) peer.destroy(); } catch (e) {}
+        relays.forEach(c => { try { c.end(true); } catch (e) {} }); } };
   } };
 }
 let olRoomLib = null, olRoomTried = false;
@@ -8590,12 +8643,12 @@ function netTick(raw) {
     $('#olGo').hidden = !(NET.role === 'host' && them);
     const hg = opp && opp.presence && OL_GAMES.some(g => g[0] === opp.presence.g) ? opp.presence.g : null;
     if (NET.role === 'guest' && hg && hg !== NET.game) { NET.game = hg; $('#olGames').querySelectorAll('.chip').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.g === hg))); }
-    const st = NET.room.status ? NET.room.status() : 'looking';
-    if (NET.role === 'guest') olMsg(opp ? `Connected! The host picked ${olGameName(hg || 'fight')}. Waiting for them to start.`
+    const st = NET.room.status ? NET.room.status() : 'looking', via = opp && NET.room.route ? (NET.room.route() === 'direct' ? ' (direct link)' : ' (through the relay)') : '';
+    if (NET.role === 'guest') olMsg(opp ? `Connected${via}! The host picked ${olGameName(hg || 'fight')}. Waiting for them to start.`
       : st === 'nohost' ? `No match called ${NET.code} right now. Check the code, and make sure the other player has pressed Create match and is still on that screen. Still trying…`
-      : st === 'slow' ? 'Found the match but can’t reach the other device yet. Still trying… If this keeps up, the network may be blocking direct game connections (common on school Wi-Fi). Try both devices on home Wi-Fi or a phone hotspot.'
+      : st === 'slow' ? 'Still trying to reach the other device… Make sure the other player is on the match screen with this code. If it never connects, this network may be blocking game connections.'
       : `Looking for match ${NET.code}…`);
-    else olMsg(them ? `${them.name} is here! Pick a game, then press Start when you’re both ready.` : 'Tell your friend this code. When they join, press Start.');
+    else olMsg(them ? `${them.name} is here${via}! Pick a game, then press Start when you’re both ready.` : 'Tell your friend this code. When they join, press Start.');
   }
   if (NET.role === 'host') {
     const hs = olHosting();
